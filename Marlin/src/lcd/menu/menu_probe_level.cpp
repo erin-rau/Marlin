@@ -49,6 +49,20 @@
   #include "../tft/touch.h"
 #endif
 
+#if HAS_LEVELING
+  /**
+   * Toggle leveling from the menu, but guard against enabling an invalid mesh.
+   */
+  void _lcd_toggle_bed_leveling_guarded() {
+    if (!planner.leveling_active && !leveling_is_valid()) {
+      LCD_MESSAGE(MSG_UBL_MESH_INVALID);
+      ui.completion_feedback(false);
+      return;
+    }
+    _lcd_toggle_bed_leveling();
+  }
+#endif
+
 #if ENABLED(LCD_BED_LEVELING) && ANY(PROBE_MANUALLY, MESH_BED_LEVELING)
 
   #include "../../module/motion.h"
@@ -266,11 +280,13 @@ void menu_probe_level() {
 
     #if HAS_LEVELING
 
-      // Homed and leveling is valid? Then leveling can be toggled.
-      if (is_homed && is_valid) {
-        bool show_state = planner.leveling_active;
-        EDIT_ITEM(bool, MSG_BED_LEVELING, &show_state, _lcd_toggle_bed_leveling);
-      }
+      bool show_state = planner.leveling_active;
+      EDIT_ITEM(bool, MSG_BED_LEVELING, &show_state, _lcd_toggle_bed_leveling_guarded);
+
+      if (!is_valid)
+        STATIC_ITEM(MSG_UBL_MESH_INVALID);
+      else if (!is_homed)
+        STATIC_ITEM(MSG_HOME_FIRST);
 
       //
       // Level Bed
