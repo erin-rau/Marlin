@@ -2460,7 +2460,10 @@
 #define EEPROM_BOOT_SILENT    // Keep M503 quiet and only give errors during first load
 #if ENABLED(EEPROM_SETTINGS)
   #define EEPROM_AUTO_INIT  // Init EEPROM automatically on any errors.
-  #define EEPROM_INIT_NOW   // Init EEPROM on first boot after a new build.
+  //#define EEPROM_INIT_NOW   // Init EEPROM on first boot after a new build.
+                              // Disabled: this wipes the saved UBL mesh on every reflash. With
+                              // EEPROM_AUTO_INIT still on, a genuinely corrupt/mismatched EEPROM is
+                              // re-initialized anyway; a valid mesh now survives firmware updates.
 #endif
 // @section host
 

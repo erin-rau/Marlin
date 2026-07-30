@@ -556,7 +556,11 @@ void GcodeSuite::G28() {
       if (finalRaiseZ) do_move_after_z_homing();
     #endif
 
-    TERN_(CAN_SET_LEVELING_AFTER_G28, if (leveling_restore_state) set_bed_leveling_enabled());
+    // Only (re-)enable leveling after homing if there's usable leveling data. Enabling UBL/mesh
+    // leveling with an invalid (unprobed, all-NaN) mesh makes the leveled move path silently drop
+    // moves, so a print appears to run (progress advances) while nothing moves. Degrade to leveling
+    // OFF instead. (Bilinear ABL is already guarded inside set_bed_leveling_enabled; this covers UBL/MBL.)
+    TERN_(CAN_SET_LEVELING_AFTER_G28, if (leveling_restore_state && leveling_is_valid()) set_bed_leveling_enabled());
 
     // Restore the active tool after homing
     #if HAS_MULTI_HOTEND && (DISABLED(DELTA) || ENABLED(DELTA_HOME_TO_SAFE_ZONE))
