@@ -783,6 +783,7 @@ namespace LanguageNarrow_en {
   LSTR MSG_FANCHECK                       = _UxGT("Fan Tacho Check");
   LSTR MSG_KILL_HOMING_FAILED             = _UxGT("Homing Failed");
   LSTR MSG_LCD_PROBING_FAILED             = _UxGT("Probing Failed");
+  LSTR MSG_LCD_PROBE_DEPLOY_FAIL          = _UxGT("Probe deploy failed");
 
   // Ender-3 V2 DWIN - ProUI / JyersUI
   LSTR MSG_COLORS_GET                     = _UxGT("Get Color");               // ProUI

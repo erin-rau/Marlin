@@ -524,7 +524,18 @@ void Probe::probe_error_stop() {
     SERIAL_ECHOPGM(STR_STOP_BLTOUCH);
   #endif
   SERIAL_ECHOLNPGM(STR_STOP_POST);
+
   stop();
+
+  // Also surface the reason on the LCD. On SD-only printers with no serial link the
+  // message above is never seen, so a failed probe deploy/stow otherwise shows only as a
+  // generic "stopped" with Z homing lost — obscuring that the probe is the real problem.
+  // Set after stop() so it isn't overwritten by the generic MSG_STOPPED it displays.
+  #if ENABLED(BLTOUCH)
+    LCD_MESSAGE(MSG_LCD_PROBE_DEPLOY_FAIL);
+  #else
+    LCD_MESSAGE(MSG_LCD_PROBING_FAILED);
+  #endif
 }
 
 /**
