@@ -1020,6 +1020,18 @@
     #define BLTOUCH_HS_EXTRA_CLEARANCE    7 // Extra Z Clearance
   #endif
 
+  /**
+   * Sticky-pin recovery. If a DEPLOY fails after the normal recovery attempts (common with clone
+   * CR Touch units whose pin intermittently sticks), don't abort the job. Instead beep and keep
+   * retrying the deploy so the pin can be freed by hand, then resume probing where it left off.
+   * Applies everywhere the probe deploys: G28 homing, UBL/mesh probing, and bed tramming.
+   */
+  #define BLTOUCH_DEPLOY_RETRY                // Beep + retry on deploy failure instead of stopping
+  #ifdef BLTOUCH_DEPLOY_RETRY
+    #define BLTOUCH_DEPLOY_RETRY_DELAY  2000  // (ms) Pause between retry beeps — time to nudge the pin
+    #define BLTOUCH_DEPLOY_RETRY_LIMIT     0  // Give up and stop after N tries (0 = retry forever)
+  #endif
+
 #endif // BLTOUCH
 
 // @section calibrate

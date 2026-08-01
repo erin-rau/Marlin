@@ -26,6 +26,11 @@
 
 #include "bltouch.h"
 
+#if ENABLED(BLTOUCH_DEPLOY_RETRY)
+  #include "../lcd/marlinui.h"  // for LCD_MESSAGE / ui.reset_status
+  #include "../libs/buzzer.h"   // for BUZZ
+#endif
+
 BLTouch bltouch;
 
 bool BLTouch::od_5v_mode;         // Initialized by settings.load, 0 = Open Drain; 1 = 5V Drain
@@ -111,8 +116,27 @@ bool BLTouch::deploy_proc() {
     if (_deploy_query_alarm()) {
       // The deploy might have failed or the probe is actually triggered (nozzle too low?) again
       if (DEBUGGING(LEVELING)) DEBUG_ECHOLNPGM("BLTouch Deploy Failed");
-      probe.probe_error_stop();            // Something is wrong, needs action, but not too bad, allow restart
-      return true;                         // Tell our caller we goofed in case he cares to know
+      #if ENABLED(BLTOUCH_DEPLOY_RETRY)
+        // Don't abort on a sticky pin. Alert (beep + on-screen message) and keep retrying the
+        // deploy so the pin can be freed by hand, then resume probing where it left off.
+        LCD_MESSAGE(MSG_LCD_PROBE_DEPLOY_FAIL);
+        for (uint16_t tries = 1; ; ++tries) {
+          BUZZ(200, 1567);                        // audible "free the pin" alert each attempt
+          safe_delay(BLTOUCH_DEPLOY_RETRY_DELAY); // keeps temps/watchdog alive; time to nudge the pin
+          clear();                                // reset alarm and cycle the pin
+          if (!_deploy_query_alarm()) break;      // recovered — carry on probing
+          #if BLTOUCH_DEPLOY_RETRY_LIMIT
+            if (tries >= (BLTOUCH_DEPLOY_RETRY_LIMIT)) {
+              probe.probe_error_stop();           // gave up after the configured number of tries
+              return true;
+            }
+          #endif
+        }
+        ui.reset_status();                        // clear the alert once the probe deploys
+      #else
+        probe.probe_error_stop();            // Something is wrong, needs action, but not too bad, allow restart
+        return true;                         // Tell our caller we goofed in case he cares to know
+      #endif
     }
   }
 
