@@ -59,7 +59,11 @@ bool leveling_is_valid() {
 void set_bed_leveling_enabled(const bool enable/*=true*/) {
   DEBUG_SECTION(log_sble, "set_bed_leveling_enabled", DEBUGGING(LEVELING));
 
-  const bool can_change = TERN1(AUTO_BED_LEVELING_BILINEAR, !enable || leveling_is_valid());
+  // Never enable mesh-based leveling (UBL/MBL/bilinear) without a valid mesh. Enabling with an
+  // invalid (unprobed, all-NaN) mesh makes the leveled move path silently drop moves, so a print
+  // appears to run (progress advances) while nothing moves. In that case leave leveling OFF and
+  // assume a flat bed. Disabling is always allowed. Non-mesh (planar ABL) has no mesh to check.
+  const bool can_change = TERN1(HAS_MESH, !enable || leveling_is_valid());
 
   if (can_change && enable != planner.leveling_active) {
 
