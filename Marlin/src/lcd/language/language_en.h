@@ -207,6 +207,8 @@ namespace LanguageNarrow_en {
   LSTR MSG_BED_TRAMMING_IN_RANGE          = _UxGT("Corners within tolerance. Bed trammed.");
   LSTR MSG_BED_TRAMMING_GOOD_POINTS       = _UxGT("Good Points: ");
   LSTR MSG_BED_TRAMMING_LAST_Z            = _UxGT("Last Z: ");
+  LSTR MSG_BED_TRAMMING_ADJUST            = _UxGT("Adjust Corners");
+  LSTR MSG_BED_TRAMMING_RESULTS           = _UxGT("Corner Offsets");
   LSTR MSG_NEXT_CORNER                    = _UxGT("Next Corner");
   LSTR MSG_MESH_EDITOR                    = _UxGT("Mesh Editor");
   LSTR MSG_MESH_VIEWER                    = _UxGT("Mesh Viewer");

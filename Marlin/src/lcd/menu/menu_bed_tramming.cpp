@@ -23,6 +23,17 @@
 //
 // Bed Tramming menu
 //
+// Probe-assisted flow (BED_TRAMMING_USE_PROBE):
+//   1. Home, then probe ALL corners in one survey pass (no user interaction).
+//   2. The highest corner becomes the baseline; the LCD shows every corner's
+//      offset below it.
+//   3. "Adjust Corners" walks only the out-of-tolerance corners, positioning the
+//      probe at the baseline plane so you raise each one until the probe triggers.
+//   4. Re-survey and repeat until every corner is within tolerance.
+//
+// This replaces the old "chase the highest corner" routine, which interleaved
+// adjustment with discovery and never showed the measured values on the LCD.
+//
 
 #include "../../inc/MarlinConfigPre.h"
 
@@ -41,24 +52,18 @@
 #endif
 
 #if ENABLED(BED_TRAMMING_USE_PROBE)
+  #include "../../libs/numtostr.h"
   #include "../../module/probe.h"
   #include "../../module/endstops.h"
+  #include "../../gcode/queue.h"
   #if ENABLED(BLTOUCH)
     #include "../../feature/bltouch.h"
   #endif
   #ifndef BED_TRAMMING_PROBE_TOLERANCE
     #define BED_TRAMMING_PROBE_TOLERANCE 0.2
   #endif
-  float last_z;
-  int good_points;
-  bool tramming_done, wait_for_probe;
 
-  #if HAS_MARLINUI_U8GLIB
-    #include "../dogm/marlinui_DOGM.h"
-  #endif
-  #define GOOD_POINTS_TO_STR(N) ui8tostr2(N)
-  #define LAST_Z_TO_STR(N) ftostr53_63(N) //ftostr42_52(N)
-
+  bool tramming_done;
 #endif
 
 static_assert(BED_TRAMMING_Z_HOP >= 0, "BED_TRAMMING_Z_HOP must be >= 0. Please update your configuration.");
@@ -91,10 +96,12 @@ constexpr float inset_lfrb[4] = BED_TRAMMING_INSET_LFRB;
 constexpr xy_pos_t lf { (X_MIN_BED) + inset_lfrb[0], (Y_MIN_BED) + inset_lfrb[1] },
                    rb { (X_MAX_BED) - inset_lfrb[2], (Y_MAX_BED) - inset_lfrb[3] };
 
+#if DISABLED(BED_TRAMMING_USE_PROBE)
+
 static int8_t bed_corner;
 
 /**
- * Move to the next corner coordinates
+ * Move to the next corner coordinates (manual, paper-drag tramming)
  */
 static void _lcd_goto_next_corner() {
   xy_pos_t corner_point = lf;                     // Left front
@@ -118,9 +125,6 @@ static void _lcd_goto_next_corner() {
         if ((lco[0] == LF && lco[1] == LB) || (lco[0] == LB && lco[1] == LF)) corner_point.x = rb.x; // Center Right
         if ((lco[0] == RF && lco[1] == RB) || (lco[0] == RB && lco[1] == RF)) corner_point.x = lf.x; // Left Center
         if ((lco[0] == LF && lco[1] == RF) || (lco[0] == RF && lco[1] == LF)) corner_point.y = rb.y; // Center Back
-        #if ENABLED(BED_TRAMMING_USE_PROBE) && DISABLED(BED_TRAMMING_INCLUDE_CENTER)
-          bed_corner++;  // Must increment the count to ensure it resets the loop if the 3rd point is out of tolerance
-        #endif
         break;
 
       #if ENABLED(BED_TRAMMING_INCLUDE_CENTER)
@@ -145,181 +149,212 @@ static void _lcd_goto_next_corner() {
   }
 
   float z = _MIN(current_position.z + (BED_TRAMMING_Z_HOP), Z_MAX_POS);
-  #if ALL(BED_TRAMMING_USE_PROBE, BLTOUCH)
-    z += bltouch.z_extra_clearance();
-  #endif
   line_to_z(z);
-  do_blocking_move_to_xy(DIFF_TERN(BED_TRAMMING_USE_PROBE, corner_point, probe.offset_xy), manual_feedrate_mm_s.x);
-  #if DISABLED(BED_TRAMMING_USE_PROBE)
-    line_to_z(BED_TRAMMING_HEIGHT);
-    if (++bed_corner >= available_points) bed_corner = 0;
-  #endif
+  do_blocking_move_to_xy(corner_point, manual_feedrate_mm_s.x);
+  line_to_z(BED_TRAMMING_HEIGHT);
+  if (++bed_corner >= available_points) bed_corner = 0;
 }
 
+#endif // DISABLED(BED_TRAMMING_USE_PROBE)
+
 #if ENABLED(BED_TRAMMING_USE_PROBE)
+
+  // Farthest the probe may descend below the nominal tramming height before giving up
+  #define BED_TRAMMING_PROBE_FLOOR ((BED_TRAMMING_HEIGHT) + (Z_PROBE_LOW_POINT))
 
   #define VALIDATE_POINT(X, Y, STR) static_assert(Probe::build_time::can_reach((X), (Y)), \
     "BED_TRAMMING_INSET_LFRB " STR " inset is not reachable with the default NOZZLE_TO_PROBE offset and PROBING_MARGIN.")
   VALIDATE_POINT(lf.x, Y_CENTER, "left"); VALIDATE_POINT(X_CENTER, lf.y, "front");
   VALIDATE_POINT(rb.x, Y_CENTER, "right"); VALIDATE_POINT(X_CENTER, rb.y, "back");
 
-  #ifndef PAGE_CONTAINS
-    #define PAGE_CONTAINS(...) true
-  #endif
+  // ---- Survey state ----
+  static float   corner_z[nr_edge_points];      // Machine Z where each corner's probe triggered (NAN = never reached)
+  static bool    corner_valid[nr_edge_points];
+  static float   tram_baseline;                 // Machine Z of the highest corner (the target plane)
+  static int8_t  tram_baseline_idx;             // Which corner (leveling-order index) is highest
+  static int8_t  tram_active_idx;               // Corner currently being probed/adjusted (for status screens)
+  static bool    tram_all_ok;                   // True when every corner is within tolerance
+  static bool    wait_for_probe;
 
-  void _lcd_draw_probing() {
-    if (!ui.should_draw()) return;
+  void tramming_results_menu();
+  void _tram_survey();
 
-    TERN_(HAS_MARLINUI_U8GLIB, ui.set_font(FONT_MENU)); // Set up the font for extra info
-
-    MenuItem_static::draw(0, GET_TEXT_F(MSG_PROBING_POINT), SS_INVERT); // "Probing Mesh" heading
-
-    uint8_t cy = TERN(TFT_COLOR_UI, 3, LCD_HEIGHT - 1), y = LCD_ROW_Y(cy);
-
-    // Enable font background for DWIN
-    TERN_(IS_DWIN_MARLINUI, dwin_font.solid = true);
-
-    // Display # of good points found vs total needed
-    if (PAGE_CONTAINS(y - (MENU_FONT_HEIGHT), y)) {
-      SETCURSOR(TERN(TFT_COLOR_UI, 2, 0), cy);
-      lcd_put_u8str(GET_TEXT_F(MSG_BED_TRAMMING_GOOD_POINTS));
-      TERN_(TFT_COLOR_UI, lcd_moveto(12, cy));
-      lcd_put_u8str(GOOD_POINTS_TO_STR(good_points));
-      lcd_put_u8str(F("/"));
-      lcd_put_u8str(GOOD_POINTS_TO_STR(nr_edge_points));
-    }
-
-    --cy;
-    y -= MENU_LINE_HEIGHT;
-
-    // Display the Last Z value
-    if (PAGE_CONTAINS(y - (MENU_FONT_HEIGHT), y)) {
-      SETCURSOR(TERN(TFT_COLOR_UI, 2, 0), cy);
-      lcd_put_u8str(GET_TEXT_F(MSG_BED_TRAMMING_LAST_Z));
-      TERN_(TFT_COLOR_UI, lcd_moveto(12, 2));
-      lcd_put_u8str(LAST_Z_TO_STR(last_z));
+  // Human-readable name for a corner in the configured leveling order
+  static FSTR_P _corner_name(const int8_t order_idx) {
+    switch (lco[order_idx]) {
+      case RF: return F("Front-Right");
+      case RB: return F("Back-Right");
+      case LB: return F("Back-Left");
+      default: return F("Front-Left"); // LF
     }
   }
 
-  void _lcd_draw_raise() {
+  // Probe landing XY for a corner in the configured leveling order
+  static xy_pos_t _corner_xy(const int8_t order_idx) {
+    xy_pos_t p = lf;
+    switch (lco[order_idx]) {
+      case RF: p.x = rb.x; break;  // Right Front
+      case RB: p   = rb;   break;  // Right Back
+      case LB: p.y = rb.y; break;  // Left Back
+    }
+    return p;
+  }
+
+  static void _tram_raise_clearance() {
+    line_to_z(_MIN(current_position.z + (BED_TRAMMING_Z_HOP), Z_MAX_POS));
+  }
+
+  // Move (probe) to a corner with a safe Z hop first
+  static void _tram_goto_corner(const int8_t order_idx) {
+    float z = _MIN(current_position.z + (BED_TRAMMING_Z_HOP), Z_MAX_POS);
+    TERN_(BLTOUCH, z += bltouch.z_extra_clearance());
+    line_to_z(z);
+    // The corner XY is the probe target; offset the nozzle so the probe lands there
+    do_blocking_move_to_xy(_corner_xy(order_idx) - probe.offset_xy, manual_feedrate_mm_s.x);
+  }
+
+  // Passive status screen shown while a survey pass runs
+  void _tram_draw_probing() {
+    if (!ui.should_draw()) return;
+    const uint8_t mid = (LCD_HEIGHT - 1) / 2;
+    MenuItem_static::draw(mid ? mid - 1 : 0, GET_TEXT_F(MSG_PROBING_POINT));
+    MenuItem_static::draw(mid, _corner_name(tram_active_idx), SS_CENTER);
+  }
+
+  // Confirm screen shown while the user raises a corner to the baseline plane
+  void _tram_draw_raise() {
     if (!ui.should_draw()) return;
     MenuItem_confirm::select_screen(
         GET_TEXT_F(MSG_BUTTON_DONE), GET_TEXT_F(MSG_BUTTON_SKIP)
-      , []{ tramming_done = true; wait_for_probe = false; }
-      , []{ wait_for_probe = false; }
-      , GET_TEXT_F(MSG_BED_TRAMMING_RAISE)
+      , []{ tramming_done = true; wait_for_probe = false; }   // Done: stop tramming entirely
+      , []{ wait_for_probe = false; }                         // Skip: leave this corner as-is
+      , _corner_name(tram_active_idx), GET_TEXT_F(MSG_BED_TRAMMING_RAISE)
     );
   }
 
-  void _lcd_draw_level_prompt() {
-    if (!ui.should_draw()) return;
-    MenuItem_confirm::select_screen(
-        GET_TEXT_F(TERN(HAS_LEVELING, MSG_BUTTON_LEVEL, MSG_BUTTON_DONE))
-      , TERN(HAS_LEVELING, GET_TEXT_F(MSG_BUTTON_BACK), nullptr)
-      , []{
-          tramming_done = true;
-          queue.inject(TERN(HAS_LEVELING, F("G29N"), FPSTR(G28_STR)));
-          ui.goto_previous_screen_no_defer();
-        }
-      , []{
-          tramming_done = true;
-          TERN_(HAS_LEVELING, ui.goto_previous_screen_no_defer());
-          TERN_(NEEDS_PROBE_DEPLOY, probe.stow(true));
-        }
-      , GET_TEXT_F(MSG_BED_TRAMMING_IN_RANGE)
-    );
-  }
-
-  // Probe down and return 'true' if the probe triggered
-  bool _lcd_bed_tramming_probe(const bool verify=false) {
-    if (verify) line_to_z(current_position.z + (BED_TRAMMING_Z_HOP));                 // Do clearance if needed
-    TERN_(BLTOUCH, if (!bltouch.high_speed_mode) bltouch.deploy());                   // Deploy in LOW SPEED MODE on every probe action
-    do_blocking_move_to_z(last_z - BED_TRAMMING_PROBE_TOLERANCE, z_probe_slow_mm_s);  // Move down to lower tolerance
-    if (TEST(endstops.trigger_state(), Z_MIN_PROBE)) {                                // Probe triggered?
+  // Probe the current XY straight down until the Z-probe triggers (live endstop)
+  // or the floor is reached. Returns the machine Z at trigger, or NAN.
+  static float _tram_probe_here() {
+    endstops.enable_z_probe(true);
+    TERN_(BLTOUCH, bltouch.deploy());
+    float measured = NAN;
+    do_blocking_move_to_z(BED_TRAMMING_PROBE_FLOOR, z_probe_slow_mm_s);
+    if (TEST(endstops.trigger_state(), Z_MIN_PROBE)) {
       endstops.hit_on_purpose();
       set_current_from_steppers_for_axis(Z_AXIS);
       sync_plan_position();
-
-      TERN_(BLTOUCH, if (!bltouch.high_speed_mode) bltouch.stow()); // Stow in LOW SPEED MODE on every trigger
-
-      // Triggered outside tolerance range?
-      if (ABS(current_position.z - last_z) > BED_TRAMMING_PROBE_TOLERANCE) {
-        last_z = current_position.z; // Above tolerance. Set a new Z for subsequent corners.
-        good_points = 0;             // ...and start over
-      }
-
-      // Raise the probe after the last point to give clearance for stow
-      if (TERN0(NEEDS_PROBE_DEPLOY, good_points == nr_edge_points - 1))
-        do_z_clearance(BED_TRAMMING_Z_HOP);
-
-      return true; // Triggered
+      measured = current_position.z;
     }
-    line_to_z(last_z); // Go back to tolerance middle point before raise
-    return false; // Not triggered
+    TERN_(BLTOUCH, bltouch.stow());
+    _tram_raise_clearance();
+    return measured;
   }
 
-  bool _lcd_bed_tramming_raise() {
-    bool probe_triggered = false;
-    tramming_done = false;
+  // Wait for the user to raise the bed until the probe triggers.
+  // Returns true if it triggered; false if the user chose Done/Skip.
+  static bool _tram_raise_wait() {
     wait_for_probe = true;
-    ui.goto_screen(_lcd_draw_raise); // show raise screen
+    ui.goto_screen(_tram_draw_raise);
     ui.set_selection(true);
-    while (wait_for_probe && !probe_triggered) { // loop while waiting to bed raise and probe trigger
-      probe_triggered = PROBE_TRIGGERED();
-      if (probe_triggered) {
+    bool triggered = false;
+    while (wait_for_probe && !triggered) {
+      triggered = PROBE_TRIGGERED();
+      if (triggered) {
         endstops.hit_on_purpose();
         TERN_(BED_TRAMMING_AUDIO_FEEDBACK, BUZZ(200, 600));
       }
       idle();
     }
-    TERN_(BLTOUCH, if (!bltouch.high_speed_mode) bltouch.stow());
-    ui.goto_screen(_lcd_draw_probing);
-    return (probe_triggered);
+    return triggered;
   }
 
-  void _lcd_test_corners() {
-    bed_corner = TERN0(BED_TRAMMING_INCLUDE_CENTER, center_index);
-    last_z = BED_TRAMMING_HEIGHT;
-    endstops.enable_z_probe(true);
-    good_points = 0;
-    ui.goto_screen(_lcd_draw_probing);
-    do {
+  // Guide the user to raise every out-of-tolerance corner to the baseline plane
+  static void _tram_adjust() {
+    ui.defer_status_screen();
+    for (int8_t i = 0; i < nr_edge_points; ++i) {
+      if (i == tram_baseline_idx) continue;                                             // The baseline corner stays put
+      if (corner_valid[i] && (tram_baseline - corner_z[i]) <= BED_TRAMMING_PROBE_TOLERANCE) continue; // Already good
+
+      tram_active_idx = i;
+      _tram_goto_corner(i);
+      TERN_(BLTOUCH, bltouch.deploy());
+      line_to_z(tram_baseline);        // Position the probe at the baseline plane; the low corner sits below it
+
+      const bool triggered = _tram_raise_wait();
+      TERN_(BLTOUCH, bltouch.stow());
+      _tram_raise_clearance();
+
+      if (!triggered && tramming_done) return;  // User chose Done -> stop entirely
+      // On Skip (or trigger) fall through to the next corner
+    }
+  }
+
+  // Probe every corner, find the highest as baseline, then show the results
+  void _tram_survey() {
+    ui.defer_status_screen();
+    ui.goto_screen(_tram_draw_probing);
+
+    for (int8_t i = 0; i < nr_edge_points; ++i) {
+      tram_active_idx = i;
       ui.refresh(LCDVIEW_REDRAW_NOW);
-      _lcd_draw_probing();                                // update screen with # of good points
+      _tram_draw_probing();
+      _tram_goto_corner(i);
+      const float z = _tram_probe_here();
+      corner_z[i] = z;
+      corner_valid[i] = !isnan(z);
+    }
 
-      _lcd_goto_next_corner();                            // Goto corner
+    // Highest valid corner becomes the baseline
+    tram_baseline = -99.0f;
+    tram_baseline_idx = 0;
+    for (int8_t i = 0; i < nr_edge_points; ++i)
+      if (corner_valid[i] && corner_z[i] > tram_baseline) { tram_baseline = corner_z[i]; tram_baseline_idx = i; }
+    if (tram_baseline < -98.0f) tram_baseline = BED_TRAMMING_HEIGHT; // No valid corners (shouldn't happen)
 
-      TERN_(BLTOUCH, if (bltouch.high_speed_mode) bltouch.deploy()); // Deploy in HIGH SPEED MODE
-      if (!_lcd_bed_tramming_probe()) {                   // Probe down to tolerance
-        if (_lcd_bed_tramming_raise()) {                  // Prompt user to raise bed if needed
-          #if ENABLED(BED_TRAMMING_VERIFY_RAISED)         // Verify
-            while (!_lcd_bed_tramming_probe(true)) {      // Loop while corner verified
-              if (!_lcd_bed_tramming_raise()) {           // Prompt user to raise bed if needed
-                if (tramming_done) return;                // Done was selected
-                break;                                    // Skip was selected
-              }
-            }
-          #endif
-        }
-        else if (tramming_done)                           // Done was selected
-          return;
-      }
+    // Everything within tolerance of the baseline?
+    tram_all_ok = true;
+    for (int8_t i = 0; i < nr_edge_points; ++i)
+      if (!corner_valid[i] || (tram_baseline - corner_z[i]) > BED_TRAMMING_PROBE_TOLERANCE) tram_all_ok = false;
 
-      if (bed_corner != center_index) good_points++; // ignore center
-      if (++bed_corner > 3) bed_corner = 0;
-
-    } while (good_points < nr_edge_points); // loop until all points within tolerance
-
-    #if ENABLED(BLTOUCH)
-      if (bltouch.high_speed_mode) {
-        // In HIGH SPEED MODE do stow and clearance at the very end
-        bltouch.stow();
-        do_z_clearance(BED_TRAMMING_Z_HOP);
-      }
-    #endif
-
-    ui.goto_screen(_lcd_draw_level_prompt); // prompt for bed leveling
+    ui.goto_screen(tramming_results_menu);
     ui.set_selection(true);
+  }
+
+  // Restore state and leave the wizard
+  void _tram_finish(const bool do_level) {
+    TERN_(BLTOUCH, bltouch.stow());
+    endstops.enable_z_probe(false);
+    SET_SOFT_ENDSTOP_LOOSE(false);
+    TERN_(HAS_LEVELING, set_bed_leveling_enabled(menu_leveling_was_active));
+    tramming_done = true;
+    if (do_level) queue.inject(TERN(HAS_LEVELING, F("G29N"), FPSTR(G28_STR)));
+    ui.goto_previous_screen_no_defer();
+  }
+
+  // Results table: each corner's offset below the highest (baseline) corner
+  void tramming_results_menu() {
+    START_MENU();
+    STATIC_ITEM(MSG_BED_TRAMMING_RESULTS, SS_DEFAULT | SS_INVERT);
+
+    for (int8_t i = 0; i < nr_edge_points; ++i) {
+      const char * const vstr = corner_valid[i]
+        ? ftostr43sign(corner_z[i] - tram_baseline, '+')  // 0.000 for the baseline, negative for lower corners
+        : "  LOW";
+      STATIC_ITEM_F(_corner_name(i), SS_LEFT, vstr);
+    }
+
+    if (tram_all_ok) {
+      STATIC_ITEM(MSG_BED_TRAMMING_IN_RANGE, SS_LEFT);
+      ACTION_ITEM(MSG_BUTTON_DONE, []{ _tram_finish(true); });
+    }
+    else {
+      ACTION_ITEM(MSG_BED_TRAMMING_ADJUST, []{
+        _tram_adjust();
+        if (tramming_done) _tram_finish(false); else _tram_survey();
+      });
+      ACTION_ITEM(MSG_BUTTON_DONE, []{ _tram_finish(false); });
+    }
+    END_MENU();
   }
 
 #endif // BED_TRAMMING_USE_PROBE
@@ -334,14 +369,11 @@ void _lcd_bed_tramming_homing() {
 
   #if ENABLED(BED_TRAMMING_USE_PROBE)
 
-    if (!tramming_done) _lcd_test_corners(); // May set tramming_done
-    if (tramming_done) {
-      ui.goto_previous_screen_no_defer();
-      TERN_(NEEDS_PROBE_DEPLOY, probe.stow(true));
-    }
-    tramming_done = true;
-    TERN_(HAS_LEVELING, set_bed_leveling_enabled(menu_leveling_was_active));
-    TERN_(BLTOUCH, endstops.enable_z_probe(false));
+    // Set up probing, loosen soft endstops so corners below Z=0 can be reached,
+    // then run the first survey pass (which hands off to the results menu).
+    endstops.enable_z_probe(true);
+    SET_SOFT_ENDSTOP_LOOSE(true);
+    _tram_survey();
 
   #else // !BED_TRAMMING_USE_PROBE
 
